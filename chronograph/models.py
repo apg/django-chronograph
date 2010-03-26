@@ -151,6 +151,9 @@ class Job(models.Model):
         run_date = datetime.now()
         self.is_running = True
         self.save()
+
+        stdout_str, stderr_str = "", ""
+
         try:
             if self.shell_command:
                 stdout_str, stderr_str = self.run_shell_command()
