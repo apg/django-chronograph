@@ -10,6 +10,9 @@ from django.utils.encoding import smart_str
 import os
 import sys
 import traceback
+import subprocess
+import shlex
+
 from datetime import datetime
 from dateutil import rrule
 from StringIO import StringIO
@@ -40,6 +43,9 @@ class Job(models.Model):
         help_text=_('Comma-separated list of <a href="http://labix.org/python-dateutil" target="_blank">rrule parameters</a>. e.g: interval:15'))
     command = models.CharField(_("command"), max_length=200,
         help_text=_("A valid django-admin command to run."), blank=True)
+    shell_command = models.CharField(_("shell command"), max_length=255,
+        help_text=_("A shell command."), blank=True)
+    run_in_shell = models.BooleanField(default=False, help_text=_('This command needs to run within a shell?'))
     args = models.CharField(_("args"), max_length=200, blank=True,
         help_text=_("Space separated list; e.g: arg1 option1=True"))
     disabled = models.BooleanField(default=False, help_text=_('If checked this job will never run.'))
@@ -48,17 +54,17 @@ class Job(models.Model):
     is_running = models.BooleanField(_("Running?"), default=False, editable=False)
     last_run_successful = models.BooleanField(default=True, blank=False, null=False, editable=False)
     subscribers = models.ManyToManyField(User, blank=True)
-    
+
     objects = JobManager()
-    
+
     class Meta:
         ordering = ('disabled', 'next_run',)
-    
+
     def __unicode__(self):
         if self.disabled:
             return _(u"%(name)s - disabled") % {'name': self.name}
         return u"%s - %s" % (self.name, self.timeuntil)
-    
+
     def save(self, force_insert=False, force_update=False):
         if not self.disabled:
             if not self.last_run:
@@ -67,7 +73,7 @@ class Job(models.Model):
                 self.next_run = self.rrule.after(self.last_run)
         else:
             self.next_run = None
-        
+
         super(Job, self).save(force_insert, force_update)
 
     def get_timeuntil(self):
@@ -77,7 +83,7 @@ class Job(models.Model):
         """
         if self.disabled:
             return _('never (disabled)')
-        
+
         delta = self.next_run - datetime.now()
         if delta.days < 0:
             # The job is past due and should be run as soon as possible
@@ -89,11 +95,11 @@ class Job(models.Model):
                 'number': delta.seconds,
                 'type': count(delta.seconds)
             }
-        
+
         return timeuntil(self.next_run)
     get_timeuntil.short_description = _('time until next run')
     timeuntil = property(get_timeuntil)
-    
+
     def get_rrule(self):
         """
         Returns the rrule objects for this Job.
@@ -101,7 +107,7 @@ class Job(models.Model):
         frequency = eval('rrule.%s' % self.frequency)
         return rrule.rrule(frequency, dtstart=self.last_run, **self.get_params())
     rrule = property(get_rrule)
-    
+
     def get_params(self):
         """
         >>> job = Job(params = "count:1;bysecond:1;byminute:1,2,4,5")
@@ -120,7 +126,7 @@ class Job(models.Model):
                     param = (param[0], param[1][0])
                 param_dict.append(param)
         return dict(param_dict)
-    
+
     def get_args(self):
         """
         Processes the args and returns a tuple or (args, options) for passing to ``call_command``.
@@ -134,53 +140,32 @@ class Job(models.Model):
             else:
                 args.append(arg)
         return (args, options)
-    
+
     def run(self, save=True):
         """
         Runs this ``Job``.  If ``save`` is ``True`` the dates (``last_run`` and ``next_run``)
         are updated.  If ``save`` is ``False`` the job simply gets run and nothing changes.
-        
+
         A ``Log`` will be created if there is any output from either stdout or stderr.
         """
-        from django.core.management import call_command
-        
-        args, options = self.get_args()
-        stdout = StringIO()
-        stderr = StringIO()
-        
-        # Redirect output so that we can log it if there is any
-        ostdout = sys.stdout
-        ostderr = sys.stderr
-        sys.stdout = stdout
-        sys.stderr = stderr
-        stdout_str, stderr_str = "", ""
-        
         run_date = datetime.now()
         self.is_running = True
         self.save()
         try:
-            call_command(self.command, *args, **options)
-            self.last_run_successful = True
-        except Exception, e:
-            # The command failed to run; log the exception
-            t = loader.get_template('chronograph/error_message.txt')
-            c = Context({
-              'exception': unicode(e),
-              'traceback': ['\n'.join(traceback.format_exception(*sys.exc_info()))]
-            })
-            stderr_str += t.render(c)
-            self.last_run_successful = False
-        self.is_running = False
-        self.save()
-        
+            if self.shell_command:
+                stdout_str, stderr_str = self.run_shell_command()
+            else:
+                stdout_str, stderr_str = self.run_management_command()
+        finally:
+            self.is_running = False
+            self.save()
+
         if save:
             self.last_run = run_date
             self.next_run = self.rrule.after(run_date)
             self.save()
-        
+
         # If we got any output, save it to the log
-        stdout_str += stdout.getvalue()
-        stderr_str += stderr.getvalue()
         if stdout_str or stderr_str:
             log = Log.objects.create(
                 job = self,
@@ -189,14 +174,78 @@ class Job(models.Model):
                 stderr = stderr_str,
                 success = self.last_run_successful,
             )
-            
+
             # Email the log output to any subscribers:
             log.email_subscribers()
-        
-        # Redirect output back to default
+
+    def run_management_command(self):
+        """
+        Runs a management command job
+        """
+        from django.core.management import call_command
+
+        args, options = self.get_args()
+        stdout = StringIO()
+        stderr = StringIO()
+
+        # Redirect output so that we can log it if there is any
+        ostdout = sys.stdout
+        ostderr = sys.stderr
+        sys.stdout = stdout
+        sys.stderr = stderr
+        stdout_str, stderr_str, exception_str = "", "", ""
+
+        try:
+            call_command(self.command, *args, **options)
+            self.last_run_successful = True
+        except Exception, e:
+            exception_str = self._get_exception_string(e, sys.exc_info())
+            self.last_run_successful = False
+
         sys.stdout = ostdout
         sys.stderr = ostderr
-            
+
+        stdout_str = stdout.getvalue()
+        stderr_str = stderr.getvalue()
+
+        return stdout_str, stderr_str + exception_str
+
+    def run_shell_command(self):
+        """
+        Returns the stdout and stderr of a command being run.
+        """
+        stdout_str, stderr_str = "", ""
+        command = self.shell_command + ' ' + (self.args or '')
+        if self.run_in_shell:
+            command = _escape_shell_command(command)
+        else:
+            command = shlex.split(command.encode('ascii'))
+        try:
+            proc = subprocess.Popen(command,
+                                    shell = bool(self.run_in_shell),
+                                    stdout = subprocess.PIPE,
+                                    stderr = subprocess.PIPE)
+
+            stdout_str, stderr_str = proc.communicate()
+            if proc.returncode:
+                stderr_str += "\n\n*** Process ended with return code %d\n\n" % proc.returncode
+            self.last_run_successful = not proc.returncode
+        except Exception, e:
+            stderr_str += self._get_exception_string(e, sys.exc_info())
+            self.last_run_successful = False
+
+        return stdout_str, stderr_str
+
+    def _get_exception_string(self, e, exc_info):
+        t = loader.get_template('chronograph/error_message.txt')
+        c = Context({
+                'exception': unicode(e),
+                'traceback': ['\n'.join(traceback.format_exception(*exc_info))]
+                })
+        return t.render(c)
+
+
+
 
 class Log(models.Model):
     """
@@ -207,21 +256,26 @@ class Log(models.Model):
     stdout = models.TextField(blank=True)
     stderr = models.TextField(blank=True)
     success = models.BooleanField(default=True, editable=False)
-        
+
     class Meta:
         ordering = ('-run_date',)
-    
+
     def __unicode__(self):
         return u"%s - %s" % (self.job.name, self.run_date)
-    
+
     def email_subscribers(self):
         subscribers = []
         for user in self.job.subscribers.all():
             subscribers.append('"%s" <%s>' % (user.get_full_name(), user.email))
-        
+
         send_mail(
             from_email = '"%s" <%s>' % (settings.EMAIL_SENDER, settings.EMAIL_HOST_USER),
             subject = '%s' % self,
             recipient_list = subscribers,
             message = "Ouput:\n%s\nError output:\n%s" % (self.stdout, self.stderr)
         )
+
+def _escape_shell_command(command):
+    for n in ('`', '$', '"'):
+        command = command.replace(n, '\%s' % n)
+    return command

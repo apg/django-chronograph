@@ -29,7 +29,27 @@ class HTMLWidget(forms.Widget):
         final_attrs = self.build_attrs(attrs, name=name)
         return mark_safe("<div%s>%s</div>" % (flatatt(final_attrs), linebreaks(value)))
 
+class JobForm(forms.ModelForm):
+    class Meta:
+        model = Job
+
+    def clean_shell_command(self):
+        if self.cleaned_data.get('command', '').strip() and \
+                self.cleaned_data.get('shell_command', '').strip():
+            raise forms.ValidationError("Can't specify a shell_command if "
+                              "a django admin command is already specified")
+        return self.cleaned_data['shell_command']
+
+    def clean(self):
+        cleaned_data = super(JobForm, self).clean()
+        if len(cleaned_data.get('command', '').strip()) and \
+                len(cleaned_data.get('shell_command', '').strip()):
+            raise forms.ValidationError("Must specify either command or "
+                                        "shell command")
+        return cleaned_data
+
 class JobAdmin(admin.ModelAdmin):
+    form = JobForm
     list_display = (
         'job_success', 'name', 'last_run_with_link', 'next_run', 'get_timeuntil',
         'frequency', 'is_running', 'run_button', 'view_logs_button',
@@ -43,7 +63,7 @@ class JobAdmin(admin.ModelAdmin):
     fieldsets = (
         ('Job Details', {
             'classes': ('wide',),
-            'fields': ('name', 'command', 'args', 'disabled',)
+            'fields': ('name', 'command', 'shell_command', 'run_in_shell', 'args', 'disabled',)
         }),
         ('E-mail subscriptions', {
             'classes': ('wide',),
