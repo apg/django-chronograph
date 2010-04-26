@@ -48,6 +48,8 @@ class Job(models.Model):
     run_in_shell = models.BooleanField(default=False, help_text=_('This command needs to run within a shell?'))
     args = models.CharField(_("args"), max_length=200, blank=True,
         help_text=_("Space separated list; e.g: arg1 option1=True"))
+    env = models.TextField(_("environment variables"), null=True, blank=True,
+                           help_text=_('ENV_VAR=value (separated by newlines)'))
     disabled = models.BooleanField(default=False, help_text=_('If checked this job will never run.'))
     next_run = models.DateTimeField(_("next run"), blank=True, null=True, help_text=_("If you don't set this it will be determined automatically"))
     last_run = models.DateTimeField(_("last run"), editable=False, blank=True, null=True)
@@ -155,10 +157,11 @@ class Job(models.Model):
         stdout_str, stderr_str = "", ""
 
         try:
+            env = parse_environment_vars(self.env)
             if self.shell_command:
-                stdout_str, stderr_str = self.run_shell_command()
+                stdout_str, stderr_str = self.run_shell_command(env)
             else:
-                stdout_str, stderr_str = self.run_management_command()
+                stdout_str, stderr_str = self.run_management_command(env)
         finally:
             self.is_running = False
             self.save()
@@ -181,7 +184,7 @@ class Job(models.Model):
             # Email the log output to any subscribers:
             log.email_subscribers()
 
-    def run_management_command(self):
+    def run_management_command(self, env):
         """
         Runs a management command job
         """
@@ -198,22 +201,26 @@ class Job(models.Model):
         sys.stderr = stderr
         stdout_str, stderr_str, exception_str = "", "", ""
 
+        tmp_env = os.environ
         try:
+            os.environ = os.environ.copy()
+            os.environ.update(env)
             call_command(self.command, *args, **options)
             self.last_run_successful = True
         except Exception, e:
             exception_str = self._get_exception_string(e, sys.exc_info())
             self.last_run_successful = False
-
-        sys.stdout = ostdout
-        sys.stderr = ostderr
+        finally:
+            os.environ = tmp_env
+            sys.stdout = ostdout
+            sys.stderr = ostderr
 
         stdout_str = stdout.getvalue()
         stderr_str = stderr.getvalue()
 
         return stdout_str, stderr_str + exception_str
 
-    def run_shell_command(self):
+    def run_shell_command(self, env):
         """
         Returns the stdout and stderr of a command being run.
         """
@@ -224,10 +231,13 @@ class Job(models.Model):
         else:
             command = shlex.split(command.encode('ascii'))
         try:
+            new_env = os.environ.copy()
+            new_env.update(env)
             proc = subprocess.Popen(command,
                                     shell = bool(self.run_in_shell),
                                     stdout = subprocess.PIPE,
-                                    stderr = subprocess.PIPE)
+                                    stderr = subprocess.PIPE,
+                                    env = new_env)
 
             stdout_str, stderr_str = proc.communicate()
             if proc.returncode:
@@ -246,9 +256,6 @@ class Job(models.Model):
                 'traceback': ['\n'.join(traceback.format_exception(*exc_info))]
                 })
         return t.render(c)
-
-
-
 
 class Log(models.Model):
     """
@@ -282,3 +289,28 @@ def _escape_shell_command(command):
     for n in ('`', '$', '"'):
         command = command.replace(n, '\%s' % n)
     return command
+
+
+def parse_environment_vars(text):
+    out = {}
+    lines = text.split('\n')
+    for line in lines:
+        # strip comments
+        uncommented = line.split('#', 1)[0].strip()
+        if '=' in uncommented:
+            key, value = [x.strip() for x in uncommented.split('=', 1)]
+            out[key] = _normalize_value(value)
+    return out
+
+
+def _normalize_value(value):
+    """Removes quoting and escapes if necessary"""
+    if value[0] in ('"', "'") and value[-1] == value[0]:
+        value = value[1:-1]
+    if '\"' in value:
+        value = vale.replace('\"', '"')
+    if "\'" in value:
+        value = value.replace("\'", "'")
+    if "\\\\" in value:
+        value = value.replace("\\\\", "\\")
+    return value
